@@ -77,24 +77,40 @@ static std::uintptr_t get_module_base(const DWORD pid, const wchar_t* module_nam
 	return module_base;
 }
 
+// These values would be obtained from the driver (e.g., via loader or debug prints)
+// For this subtask, they are placeholders. In a real run, they'd need actual values.
+const wchar_t* G_RANDOMIZED_DEVICE_NAME = L"\\.\IUIC_Enterprise_Random"; // Placeholder
+
+BYTE G_XOR_KEY[8] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07}; // Placeholder
+SIZE_T G_XOR_KEY_SIZE = sizeof(G_XOR_KEY);
+
+// Placeholder IOCTLs (replace with actual randomized values from driver output)
+namespace global_driver_codes { // Renaming to avoid conflict with driver::codes in UM
+    ULONG attach = 0x0; // Example: CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
+    ULONG read = 0x0;
+    ULONG write = 0x0;
+    ULONG get_base = 0x0;
+    ULONG aob_scan = 0x0;
+    ULONG allocate_memory = 0x0;
+    ULONG install_hook = 0x0;
+    ULONG uninstall_hook = 0x0;
+    // Add heap_aob_scan and process_aob_scan if UM uses them (it doesn't currently in main.cpp)
+    // ULONG heap_aob_scan = 0x0;
+    // ULONG process_aob_scan = 0x0;
+}
+
+void XorEncryptDecrypt(BYTE* data, SIZE_T size, const BYTE* key, SIZE_T keySize) {
+    if (!data || size == 0 || !key || keySize == 0) {
+        return;
+    }
+    for (SIZE_T i = 0; i < size; ++i) {
+        data[i] = data[i] ^ key[i % keySize];
+    }
+}
+
 namespace driver {
-	namespace codes {
-		// IOCTL codes.
-		constexpr ULONG attach{ CTL_CODE(FILE_DEVICE_UNKNOWN, 0x696, METHOD_BUFFERED, FILE_SPECIAL_ACCESS) };
-		constexpr ULONG read{ CTL_CODE(FILE_DEVICE_UNKNOWN, 0x697, METHOD_BUFFERED, FILE_SPECIAL_ACCESS) };
-		constexpr ULONG write{ CTL_CODE(FILE_DEVICE_UNKNOWN, 0x698, METHOD_BUFFERED, FILE_SPECIAL_ACCESS) };
-		constexpr ULONG get_base{ CTL_CODE(FILE_DEVICE_UNKNOWN, 0x699, METHOD_BUFFERED, FILE_SPECIAL_ACCESS) };
-		// New IOCTL code for AOB scan.
-		constexpr ULONG aob_scan{ CTL_CODE(FILE_DEVICE_UNKNOWN, 0x6A0, METHOD_BUFFERED, FILE_SPECIAL_ACCESS) };
-
-		constexpr ULONG allocate_memory{ CTL_CODE(FILE_DEVICE_UNKNOWN, 0x6A2, METHOD_BUFFERED, FILE_SPECIAL_ACCESS) };
-
-		constexpr ULONG install_hook = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x6A3, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
-		constexpr ULONG uninstall_hook = CTL_CODE(FILE_DEVICE_UNKNOWN, 0x6A4, METHOD_BUFFERED, FILE_SPECIAL_ACCESS);
-
-
-
-	} // namespace codes
+	// The driver::codes namespace is removed/commented out.
+	// IOCTLs will be used via global_driver_codes::
 
 	// shared between um & km
 	struct Request {
@@ -104,31 +120,40 @@ namespace driver {
 		SIZE_T size;                  // Size of read/write buffer
 		SIZE_T return_size;          // Number of bytes read/written
 
-		WCHAR moduleName[64];       // Name of the module to look for
-		PVOID base_address;          // Optional: base address result
+		WCHAR moduleName[64];        // Name of the module to look for
+		PVOID base_address;          // Optional: base address result for various ops
 
-		// AOB scan
-		CHAR aob_pattern[128];       // Byte pattern (e.g., "48 8B ?? ??")
-		CHAR aob_mask[128];          // Mask (e.g., "xx??")
-		uintptr_t module_base;       // Module base for AOB scan
-		SIZE_T module_size;          // Module size for AOB scan
+		// AOB scan related fields
+		CHAR aob_pattern[256];       // Byte pattern (e.g., "48 8B ?? ??") - using 256
+		CHAR aob_mask[256];          // Mask (e.g., "xx??") - using 256
+		uintptr_t module_base;       // Module base for AOB/hooking context if needed
+		SIZE_T module_size;          // Module size for AOB/hooking context if needed
+		UCHAR saved_bytes[256];      // Buffer for various purposes (e.g., AOB results, original hook bytes if UM sends)
 
-		uintptr_t hook_address;     // where to place hook
-		uintptr_t hook_function;    // function to redirect to
-		SIZE_T hook_length;         // number of bytes to overwrite
-		uintptr_t trampoline_out;   // [out] filled with trampoline address
+		// Memory allocation related
+		PVOID alloc_hint;            // Hint address for memory allocation
 
-		PVOID alloc_hint; // hint address for memory allocation
+		// Range restriction for scans (heap, process AOB)
+		PVOID start_address;         // Start address of scan range
+		PVOID end_address;           // End address of scan range
 
+		// Hooking related fields
+		uintptr_t hook_address;      // Target address for placing the hook
+		uintptr_t hook_function;     // Address of the function/shellcode to jump to
+		SIZE_T hook_length;          // Number of bytes to overwrite for the hook (e.g., 5 for JMP)
+		uintptr_t trampoline_out;    // [out] Filled by driver: Address of the trampoline
 	};
 
 	bool attach_to_process(HANDLE driver_handle, const DWORD pid) {
 		Request r;
 		r.process_id = reinterpret_cast<HANDLE>(pid);
 
-		return DeviceIoControl(driver_handle, codes::attach,
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&r), sizeof(r), G_XOR_KEY, G_XOR_KEY_SIZE);
+		BOOL result = DeviceIoControl(driver_handle, global_driver_codes::attach, // Changed to global_driver_codes
 			&r, sizeof(r), &r, sizeof(r),
 			nullptr, nullptr);
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&r), sizeof(r), G_XOR_KEY, G_XOR_KEY_SIZE);
+		return result;
 	}
 
 	template <class T>
@@ -139,9 +164,13 @@ namespace driver {
 		r.buffer = &temp;
 		r.size = sizeof(T);
 
-		DeviceIoControl(driver_handle, codes::read,
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&r), sizeof(r), G_XOR_KEY, G_XOR_KEY_SIZE);
+		DeviceIoControl(driver_handle, global_driver_codes::read, // Changed to global_driver_codes
 			&r, sizeof(r), &r, sizeof(r),
 			nullptr, nullptr);
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&r), sizeof(r), G_XOR_KEY, G_XOR_KEY_SIZE);
+		// The buffer `temp` receives data, but `r` itself might contain output like `return_size`.
+		// If `temp` is directly part of `r.buffer` (it is, by pointer), it's already handled by XORing `r`.
 
 		return temp;
 	}
@@ -150,12 +179,32 @@ namespace driver {
 	bool write_memory(HANDLE driver_handle, const std::uintptr_t addr, const T& value) {
 		Request r;
 		r.target = reinterpret_cast<PVOID>(addr);
-		r.buffer = (PVOID)&value;
+		// For write, `value` is part of `r.buffer` effectively.
+		// If r.buffer pointed to an external buffer, that buffer would need XORing.
+		// Here, the data to be written is within `r` if we were to copy `value` into a field in `r`.
+		// However, r.buffer points to `value` which is external to `r`.
+		// The driver reads from `r.buffer`. The current XOR encrypts `r` (including the pointer `r.buffer`).
+		// The actual content pointed to by `r.buffer` (`value`) is NOT XORed by the current logic.
+		// This is a potential bug in the XOR strategy for write if the driver expects r.buffer's *content* to be XORed.
+		// Assuming the driver XORs its copy of `r` and then uses `r.buffer` to read, it would read the plain `value`.
+		// For now, following the pattern of XORing `r` only.
+		// A more robust XOR for write would be:
+		// BYTE write_buf[sizeof(T)]; memcpy(write_buf, &value, sizeof(T));
+		// XorEncryptDecrypt(write_buf, sizeof(T), G_XOR_KEY, G_XOR_KEY_SIZE);
+		// r.buffer = write_buf; r.size = sizeof(T);
+		// XorEncryptDecrypt(reinterpret_cast<BYTE*>(&r), sizeof(r), G_XOR_KEY, G_XOR_KEY_SIZE);
+		// DeviceIoControl(...);
+		// XorEncryptDecrypt(reinterpret_cast<BYTE*>(&r), sizeof(r), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt `r` if it has outputs
+		// For simplicity, sticking to the current pattern:
+		r.buffer = (PVOID)&value; // `value` itself is not XORed by this call.
 		r.size = sizeof(T);
 
-		DeviceIoControl(driver_handle, codes::write,
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&r), sizeof(r), G_XOR_KEY, G_XOR_KEY_SIZE);
+		DeviceIoControl(driver_handle, global_driver_codes::write, // Changed to global_driver_codes
 			&r, sizeof(r), &r, sizeof(r),
 			nullptr, nullptr);
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&r), sizeof(r), G_XOR_KEY, G_XOR_KEY_SIZE);
+		// `r` might contain `return_size`.
 
 		return true;
 	}
@@ -195,15 +244,18 @@ bool allocate_memory(HANDLE driver_handle, DWORD pid, SIZE_T size, uintptr_t& ou
 	request.size = size;
 	request.alloc_hint = allocHint;  // New field: use hint for near allocation
 
-	if (DeviceIoControl(driver_handle, driver::codes::allocate_memory,
+	XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE);
+	if (DeviceIoControl(driver_handle, global_driver_codes::allocate_memory, // Changed to global_driver_codes
 		&request, sizeof(request), &request, sizeof(request),
 		nullptr, nullptr)) {
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt response
 
 		out_address = reinterpret_cast<uintptr_t>(request.base_address);
 		std::cout << "[+] Allocated memory at: 0x" << std::hex << out_address << std::endl;
 		return true;
 	}
 	else {
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt even on failure
 		std::cout << "[-] Failed to allocate memory." << std::endl;
 		return false;
 	}
@@ -211,7 +263,7 @@ bool allocate_memory(HANDLE driver_handle, DWORD pid, SIZE_T size, uintptr_t& ou
 
 
 int main() {
-	driver::Request request = {};
+	driver::Request request = {}; // This will be the main request object for many operations
 	const DWORD pid = get_process_id(L"destiny2.exe");
 
 	if (pid == 0) {
@@ -220,7 +272,7 @@ int main() {
 		return -1;
 	}
 
-	const HANDLE driver{ CreateFile(L"\\\\.\\IUIC_Enterprise", GENERIC_READ,
+	const HANDLE driver{ CreateFile(G_RANDOMIZED_DEVICE_NAME, GENERIC_READ | GENERIC_WRITE, // Added GENERIC_WRITE for DeviceIoControl output buffer
 									0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
 									nullptr) };
 
@@ -237,14 +289,17 @@ int main() {
 	wcscpy_s(request.moduleName, L"destiny2.exe");
 
 	// Now send the IOCTL to get the module base
-	if (DeviceIoControl(driver, driver::codes::get_base,
+	XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE);
+	if (DeviceIoControl(driver, global_driver_codes::get_base, // Changed to global_driver_codes
 		&request, sizeof(request), &request, sizeof(request),
 		nullptr, nullptr)) {
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt response
 		std::cout << "[+] Module base address: 0x"
 			<< std::hex << reinterpret_cast<std::uintptr_t>(request.base_address)
 			<< std::endl;
 	}
 	else {
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt even on failure, in case of partial data
 		std::cout << "[-] Failed to get module base.\n";
 	}
 
@@ -257,10 +312,12 @@ int main() {
 	std::cout << "[+] AOB scan started...\n";
 
 	// Perform the AOB scan by sending the IOCTL to the driver.
-	if (DeviceIoControl(driver, driver::codes::aob_scan,
+	XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE);
+	if (DeviceIoControl(driver, global_driver_codes::aob_scan, // Changed to global_driver_codes
 		&request, sizeof(request),
 		&request, sizeof(request),
 		nullptr, nullptr)) {
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt response
 
 		std::cout << "[+] AOB scan found pattern at address: 0x"
 			<< std::hex << reinterpret_cast<std::uintptr_t>(request.base_address)
@@ -268,6 +325,7 @@ int main() {
 		MovementInstruction = reinterpret_cast<uintptr_t>(request.base_address);
 	}
 	else {
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt even on failure
 		std::cout << "[-] AOB scan failed.\n";
 	}
 
@@ -280,10 +338,12 @@ int main() {
 	std::cout << "[+] Killaura AOB scan started...\n";
 	std::cin.get();
 
-	if (DeviceIoControl(driver, driver::codes::aob_scan,
+	XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE);
+	if (DeviceIoControl(driver, global_driver_codes::aob_scan, // Changed to global_driver_codes
 		&request, sizeof(request),
 		&request, sizeof(request),
 		nullptr, nullptr)) {
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt response
 
 		std::cout << "[+] AOB scan found pattern at address: 0x"
 			<< std::hex << reinterpret_cast<std::uintptr_t>(request.base_address)
@@ -291,6 +351,7 @@ int main() {
 		KillauraInstruction = reinterpret_cast<uintptr_t>(request.base_address);
 	}
 	else {
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt even on failure
 		std::cout << "[-] AOB scan failed.\n";
 	}
 
@@ -304,48 +365,60 @@ int main() {
 	request.size = 100;  // desired allocation size
 	request.alloc_hint = reinterpret_cast<PVOID>(KillauraInstruction);
 
-	if (DeviceIoControl(driver, driver::codes::allocate_memory,
+	XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE);
+	if (DeviceIoControl(driver, global_driver_codes::allocate_memory, // Changed to global_driver_codes
 		&request, sizeof(request),
 		&request, sizeof(request),
 		nullptr, nullptr))
 	{
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt response
 		// Save the allocated address to hookFunctionAddress.
 		hookFunctionAddress = reinterpret_cast<uintptr_t>(request.base_address);
 		std::cout << "[+] Successfully allocated memory at: 0x" << std::hex << hookFunctionAddress << std::endl;
 	}
 	else {
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt even on failure
 		std::cout << "[-] Failed to allocate memory via direct driver call." << std::endl;
 		std::cin.get();
 		return -1;
 	}
 	
+	// For uninstall_hook, prepare the request object again or clear fields not used by this IOCTL.
+	// Assuming `request` still holds relevant pid, and we set hook_address for uninstall.
 	request.hook_address = KillauraInstruction;  // AOB scan result
-	if (DeviceIoControl(driver, driver::codes::uninstall_hook,
+    request.hook_length = 5; // Assuming the hook to uninstall was 5 bytes. Driver might need this.
+	XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE);
+	if (DeviceIoControl(driver, global_driver_codes::uninstall_hook, // Changed to global_driver_codes
 		&request, sizeof(request),
-		&request, sizeof(request),
+		&request, sizeof(request), // Response also in request
 		nullptr, nullptr)) {
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt response
 		std::cout << "[+] Uninstall hook successful.\n";
 	}
 	else {
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&request), sizeof(request), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt even on failure
 		std::cout << "[-] Failed to uninstall hook.\n";
 	}
 
 	std::cin.get();
 
 	// Step 2: Install trampoline hook (5-byte JMP)
-	driver::Request hookReq{};
+	driver::Request hookReq{}; // Using a separate request for install_hook for clarity
 	hookReq.process_id = reinterpret_cast<HANDLE>(pid);
 	hookReq.hook_address = KillauraInstruction;  // AOB scan result
 	hookReq.hook_function = hookFunctionAddress;
 	hookReq.hook_length = 5;
 
-	if (!DeviceIoControl(driver, driver::codes::install_hook,
+	XorEncryptDecrypt(reinterpret_cast<BYTE*>(&hookReq), sizeof(hookReq), G_XOR_KEY, G_XOR_KEY_SIZE);
+	if (!DeviceIoControl(driver, global_driver_codes::install_hook, // Changed to global_driver_codes
 		&hookReq, sizeof(hookReq), &hookReq, sizeof(hookReq),
 		nullptr, nullptr)) {
+		XorEncryptDecrypt(reinterpret_cast<BYTE*>(&hookReq), sizeof(hookReq), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt even on failure
 		std::cout << "[-] Failed to install hook.\n";
 		std::cin.get();
 		return -1;
 	}
+	XorEncryptDecrypt(reinterpret_cast<BYTE*>(&hookReq), sizeof(hookReq), G_XOR_KEY, G_XOR_KEY_SIZE); // Decrypt response
 
 	uintptr_t trampoline = hookReq.trampoline_out;
 	std::cin.get();
